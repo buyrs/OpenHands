@@ -32,7 +32,7 @@ export function DeleteApiKeyModal({
       await deleteApiKeyMutation.mutateAsync(keyToDelete.id);
       displaySuccessToast(t(I18nKey.SETTINGS$API_KEY_DELETED));
       onClose();
-    } catch (error) {
+    } catch {
       displayErrorToast(t(I18nKey.ERROR$GENERIC));
     }
   };
@@ -73,7 +73,7 @@ export function DeleteApiKeyModal({
       footer={modalFooter}
     >
       <div data-testid="delete-api-key-modal">
-        <p className="text-sm">
+        <p className="text-sm break-all">
           {t(I18nKey.SETTINGS$DELETE_API_KEY_CONFIRMATION, {
             name: keyToDelete.name,
           })}

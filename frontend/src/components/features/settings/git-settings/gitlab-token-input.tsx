@@ -3,6 +3,7 @@ import { I18nKey } from "#/i18n/declaration";
 import { SettingsInput } from "../settings-input";
 import { GitLabTokenHelpAnchor } from "./gitlab-token-help-anchor";
 import { KeyStatusIcon } from "../key-status-icon";
+import { cn } from "#/utils/utils";
 
 interface GitLabTokenInputProps {
   onChange: (value: string) => void;
@@ -10,6 +11,7 @@ interface GitLabTokenInputProps {
   isGitLabTokenSet: boolean;
   name: string;
   gitlabHostSet: string | null | undefined;
+  className?: string;
 }
 
 export function GitLabTokenInput({
@@ -18,18 +20,19 @@ export function GitLabTokenInput({
   isGitLabTokenSet,
   name,
   gitlabHostSet,
+  className,
 }: GitLabTokenInputProps) {
   const { t } = useTranslation();
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className={cn("flex flex-col gap-6", className)}>
       <SettingsInput
         testId={name}
         name={name}
         onChange={onChange}
         label={t(I18nKey.GITLAB$TOKEN_LABEL)}
         type="password"
-        className="w-[680px]"
+        className="w-full max-w-[680px]"
         placeholder={isGitLabTokenSet ? "<hidden>" : ""}
         startContent={
           isGitLabTokenSet && (
@@ -47,7 +50,7 @@ export function GitLabTokenInput({
         testId="gitlab-host-input"
         label={t(I18nKey.GITLAB$HOST_LABEL)}
         type="text"
-        className="w-[680px]"
+        className="w-full max-w-[680px]"
         placeholder="gitlab.com"
         defaultValue={gitlabHostSet || undefined}
         startContent={

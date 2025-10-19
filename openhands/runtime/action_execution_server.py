@@ -1,5 +1,4 @@
-"""
-This is the main file for the runtime client.
+"""This is the main file for the runtime client.
 It is responsible for executing actions received from OpenHands backend and producing observations.
 
 NOTE: this will be executed inside the docker sandbox.
@@ -9,25 +8,22 @@ import argparse
 import asyncio
 import base64
 import json
-import logging
 import mimetypes
 import os
 import shutil
 import sys
 import tempfile
 import time
-import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from zipfile import ZipFile
 
+import puremagic
 from binaryornot.check import is_binary
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
-from mcpm import MCPRouter, RouterConfig
-from mcpm.router.router import logger as mcp_router_logger
 from openhands_aci.editor.editor import OHEditor
 from openhands_aci.editor.exceptions import ToolError
 from openhands_aci.editor.results import ToolResult
@@ -37,7 +33,9 @@ from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from uvicorn import run
 
+from openhands.core.config.mcp_config import MCPStdioServerConfig
 from openhands.core.exceptions import BrowserUnavailableException
+from openhands.core.logger import get_uvicorn_json_log_config
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import (
     Action,
@@ -53,6 +51,7 @@ from openhands.events.event import FileEditSource, FileReadSource
 from openhands.events.observation import (
     CmdOutputObservation,
     ErrorObservation,
+    FileDownloadObservation,
     FileEditObservation,
     FileReadObservation,
     FileWriteObservation,
@@ -63,19 +62,20 @@ from openhands.events.serialization import event_from_dict, event_to_dict
 from openhands.runtime.browser import browse
 from openhands.runtime.browser.browser_env import BrowserEnv
 from openhands.runtime.file_viewer_server import start_file_viewer_server
+
+# Import our custom MCP Proxy Manager
+from openhands.runtime.mcp.proxy import MCPProxyManager
 from openhands.runtime.plugins import ALL_PLUGINS, JupyterPlugin, Plugin, VSCodePlugin
 from openhands.runtime.utils import find_available_tcp_port
-from openhands.runtime.utils.async_bash import AsyncBashSession
 from openhands.runtime.utils.bash import BashSession
 from openhands.runtime.utils.files import insert_lines, read_lines
 from openhands.runtime.utils.memory_monitor import MemoryMonitor
 from openhands.runtime.utils.runtime_init import init_user_and_working_directory
-from openhands.runtime.utils.system_stats import get_system_stats
+from openhands.runtime.utils.system_stats import (
+    get_system_stats,
+    update_last_execution_time,
+)
 from openhands.utils.async_utils import call_sync_from_async, wait_all
-
-# Set MCP router logger to the same level as the main logger
-mcp_router_logger.setLevel(logger.getEffectiveLevel())
-
 
 if sys.platform == 'win32':
     from openhands.runtime.utils.windows_bash import WindowsPowershellSession
@@ -174,6 +174,7 @@ class ActionExecutor:
         work_dir: str,
         username: str,
         user_id: int,
+        enable_browser: bool,
         browsergym_eval_env: str | None,
     ) -> None:
         self.plugins_to_load = plugins_to_load
@@ -190,13 +191,21 @@ class ActionExecutor:
         self.lock = asyncio.Lock()
         self.plugins: dict[str, Plugin] = {}
         self.file_editor = OHEditor(workspace_root=self._initial_cwd)
+        self.enable_browser = enable_browser
         self.browser: BrowserEnv | None = None
         self.browser_init_task: asyncio.Task | None = None
         self.browsergym_eval_env = browsergym_eval_env
 
+        if (not self.enable_browser) and self.browsergym_eval_env:
+            raise BrowserUnavailableException(
+                'Browser environment is not enabled in config, but browsergym_eval_env is set'
+            )
+
         self.start_time = time.time()
         self.last_execution_time = self.start_time
         self._initialized = False
+        self.downloaded_files: list[str] = []
+        self.downloads_directory = '/workspace/.downloads'
 
         self.max_memory_gb: int | None = None
         if _override_max_memory_gb := os.environ.get('RUNTIME_MAX_MEMORY_GB', None):
@@ -219,6 +228,10 @@ class ActionExecutor:
 
     async def _init_browser_async(self):
         """Initialize the browser asynchronously."""
+        if not self.enable_browser:
+            logger.info('Browser environment is not enabled in config')
+            return
+
         if sys.platform == 'win32':
             logger.warning('Browser environment not supported on windows')
             return
@@ -228,7 +241,7 @@ class ActionExecutor:
             self.browser = BrowserEnv(self.browsergym_eval_env)
             logger.debug('Browser initialized asynchronously')
         except Exception as e:
-            logger.error(f'Failed to initialize browser: {e}')
+            logger.exception(f'Failed to initialize browser: {e}')
             self.browser = None
 
     async def _ensure_browser_ready(self):
@@ -253,12 +266,10 @@ class ActionExecutor:
         # If we get here, the browser is ready
         logger.debug('Browser is ready')
 
-    async def ainit(self):
-        # bash needs to be initialized first
-        logger.debug('Initializing bash session')
+    def _create_bash_session(self, cwd: str | None = None):
         if sys.platform == 'win32':
-            self.bash_session = WindowsPowershellSession(  # type: ignore[name-defined]
-                work_dir=self._initial_cwd,
+            return WindowsPowershellSession(  # type: ignore[name-defined]
+                work_dir=cwd or self._initial_cwd,
                 username=self.username,
                 no_change_timeout_seconds=int(
                     os.environ.get('NO_CHANGE_TIMEOUT_SECONDS', 10)
@@ -266,15 +277,21 @@ class ActionExecutor:
                 max_memory_mb=self.max_memory_gb * 1024 if self.max_memory_gb else None,
             )
         else:
-            self.bash_session = BashSession(
-                work_dir=self._initial_cwd,
+            bash_session = BashSession(
+                work_dir=cwd or self._initial_cwd,
                 username=self.username,
                 no_change_timeout_seconds=int(
                     os.environ.get('NO_CHANGE_TIMEOUT_SECONDS', 10)
                 ),
                 max_memory_mb=self.max_memory_gb * 1024 if self.max_memory_gb else None,
             )
-            self.bash_session.initialize()
+            bash_session.initialize()
+            return bash_session
+
+    async def ainit(self):
+        # bash needs to be initialized first
+        logger.debug('Initializing bash session')
+        self.bash_session = self._create_bash_session()
         logger.debug('Bash session initialized')
 
         # Start browser initialization in the background
@@ -283,7 +300,7 @@ class ActionExecutor:
 
         await wait_all(
             (self._init_plugin(plugin) for plugin in self.plugins_to_load),
-            timeout=60,
+            timeout=int(os.environ.get('INIT_PLUGIN_TIMEOUT', '120')),
         )
         logger.debug('All plugins initialized')
 
@@ -311,7 +328,12 @@ class ActionExecutor:
 
     async def _init_plugin(self, plugin: Plugin):
         assert self.bash_session is not None
-        await plugin.initialize(self.username)
+        # VSCode plugin needs runtime_id for path-based routing when using Gateway API
+        if isinstance(plugin, VSCodePlugin):
+            runtime_id = os.environ.get('RUNTIME_ID')
+            await plugin.initialize(self.username, runtime_id=runtime_id)
+        else:
+            await plugin.initialize(self.username)
         self.plugins[plugin.name] = plugin
         logger.debug(f'Initializing plugin: {plugin.name}')
 
@@ -323,38 +345,10 @@ class ActionExecutor:
             )
 
     async def _init_bash_commands(self):
+        # You can add any bash commands you want to run on startup here
+        # It is empty because: Git configuration is now handled by the runtime client after connection
         INIT_COMMANDS = []
-        is_local_runtime = os.environ.get('LOCAL_RUNTIME_MODE') == '1'
         is_windows = sys.platform == 'win32'
-
-        # Determine git config commands based on platform and runtime mode
-        if is_local_runtime:
-            if is_windows:
-                # Windows, local - split into separate commands
-                INIT_COMMANDS.append(
-                    'git config --file ./.git_config user.name "openhands"'
-                )
-                INIT_COMMANDS.append(
-                    'git config --file ./.git_config user.email "openhands@all-hands.dev"'
-                )
-                INIT_COMMANDS.append(
-                    '$env:GIT_CONFIG = (Join-Path (Get-Location) ".git_config")'
-                )
-            else:
-                # Linux/macOS, local
-                base_git_config = (
-                    'git config --file ./.git_config user.name "openhands" && '
-                    'git config --file ./.git_config user.email "openhands@all-hands.dev" && '
-                    'export GIT_CONFIG=$(pwd)/.git_config'
-                )
-                INIT_COMMANDS.append(base_git_config)
-        else:
-            # Non-local (implies Linux/macOS)
-            base_git_config = (
-                'git config --global user.name "openhands" && '
-                'git config --global user.email "openhands@all-hands.dev"'
-            )
-            INIT_COMMANDS.append(base_git_config)
 
         # Determine no-pager command
         if is_windows:
@@ -363,6 +357,11 @@ class ActionExecutor:
             no_pager_cmd = 'alias git="git --no-pager"'
 
         INIT_COMMANDS.append(no_pager_cmd)
+
+        # Hack: for some reason when you set the openhands user to anything but root, tmux changes out
+        # of the mount directory on the first invocation.
+        if self.user_id != 0:
+            INIT_COMMANDS.append(f'cd {self._initial_cwd}')
 
         logger.info(f'Initializing by running {len(INIT_COMMANDS)} bash commands...')
         for command in INIT_COMMANDS:
@@ -387,21 +386,14 @@ class ActionExecutor:
         self, action: CmdRunAction
     ) -> CmdOutputObservation | ErrorObservation:
         try:
+            bash_session = self.bash_session
             if action.is_static:
-                path = action.cwd or self._initial_cwd
-                result = await AsyncBashSession.execute(action.command, path)
-                obs = CmdOutputObservation(
-                    content=result.content,
-                    exit_code=result.exit_code,
-                    command=action.command,
-                )
-                return obs
-
-            assert self.bash_session is not None
-            obs = await call_sync_from_async(self.bash_session.execute, action)
+                bash_session = self._create_bash_session(action.cwd)
+            assert bash_session is not None
+            obs = await call_sync_from_async(bash_session.execute, action)
             return obs
         except Exception as e:
-            logger.error(f'Error running command: {e}')
+            logger.exception(f'Error running command: {e}')
             return ErrorObservation(str(e))
 
     async def run_ipython(self, action: IPythonRunCellAction) -> Observation:
@@ -474,7 +466,7 @@ class ActionExecutor:
         filepath = self._resolve_path(action.path, working_dir)
         try:
             if filepath.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
-                with open(filepath, 'rb') as file:  # noqa: ASYNC101
+                with open(filepath, 'rb') as file:
                     image_data = file.read()
                     encoded_image = base64.b64encode(image_data).decode('utf-8')
                     mime_type, _ = mimetypes.guess_type(filepath)
@@ -484,13 +476,13 @@ class ActionExecutor:
 
                 return FileReadObservation(path=filepath, content=encoded_image)
             elif filepath.lower().endswith('.pdf'):
-                with open(filepath, 'rb') as file:  # noqa: ASYNC101
+                with open(filepath, 'rb') as file:
                     pdf_data = file.read()
                     encoded_pdf = base64.b64encode(pdf_data).decode('utf-8')
                     encoded_pdf = f'data:application/pdf;base64,{encoded_pdf}'
                 return FileReadObservation(path=filepath, content=encoded_pdf)
             elif filepath.lower().endswith(('.mp4', '.webm', '.ogg')):
-                with open(filepath, 'rb') as file:  # noqa: ASYNC101
+                with open(filepath, 'rb') as file:
                     video_data = file.read()
                     encoded_video = base64.b64encode(video_data).decode('utf-8')
                     mime_type, _ = mimetypes.guess_type(filepath)
@@ -500,7 +492,7 @@ class ActionExecutor:
 
                 return FileReadObservation(path=filepath, content=encoded_video)
 
-            with open(filepath, 'r', encoding='utf-8') as file:  # noqa: ASYNC101
+            with open(filepath, 'r', encoding='utf-8') as file:
                 lines = read_lines(file.readlines(), action.start, action.end)
         except FileNotFoundError:
             return ErrorObservation(
@@ -533,7 +525,7 @@ class ActionExecutor:
 
         mode = 'w' if not file_exists else 'r+'
         try:
-            with open(filepath, mode, encoding='utf-8') as file:  # noqa: ASYNC101
+            with open(filepath, mode, encoding='utf-8') as file:
                 if mode != 'w':
                     all_lines = file.readlines()
                     new_file = insert_lines(insert, all_lines, action.start, action.end)
@@ -599,7 +591,7 @@ class ActionExecutor:
     async def browse(self, action: BrowseURLAction) -> Observation:
         if self.browser is None:
             return ErrorObservation(
-                'Browser functionality is not supported on Windows.'
+                'Browser functionality is not supported or disabled.'
             )
         await self._ensure_browser_ready()
         return await browse(action, self.browser, self.initial_cwd)
@@ -607,10 +599,48 @@ class ActionExecutor:
     async def browse_interactive(self, action: BrowseInteractiveAction) -> Observation:
         if self.browser is None:
             return ErrorObservation(
-                'Browser functionality is not supported on Windows.'
+                'Browser functionality is not supported or disabled.'
             )
         await self._ensure_browser_ready()
-        return await browse(action, self.browser, self.initial_cwd)
+        browser_observation = await browse(action, self.browser, self.initial_cwd)
+        if not browser_observation.error:
+            return browser_observation
+        else:
+            curr_files = os.listdir(self.downloads_directory)
+            new_download = False
+            for file in curr_files:
+                if file not in self.downloaded_files:
+                    new_download = True
+                    self.downloaded_files.append(file)
+                    break  # FIXME: assuming only one file will be downloaded for simplicity
+
+            if not new_download:
+                return browser_observation
+            else:
+                # A new file is downloaded in self.downloads_directory, shift file to /workspace
+                src_path = os.path.join(
+                    self.downloads_directory, self.downloaded_files[-1]
+                )
+                # Guess extension of file using puremagic and add it to tgt_path file name
+                file_ext = ''
+                try:
+                    guesses = puremagic.magic_file(src_path)
+                    if len(guesses) > 0:
+                        ext = guesses[0].extension.strip()
+                        if len(ext) > 0:
+                            file_ext = ext
+                except Exception as _:
+                    pass
+
+                tgt_path = os.path.join(
+                    '/workspace', f'file_{len(self.downloaded_files)}{file_ext}'
+                )
+                shutil.copy(src_path, tgt_path)
+                file_download_obs = FileDownloadObservation(
+                    content=f'Execution of the previous action {action.browser_actions} resulted in a file download. The downloaded file is saved at location: {tgt_path}',
+                    file_path=tgt_path,
+                )
+                return file_download_obs
 
     def close(self):
         self.memory_monitor.stop_monitoring()
@@ -622,7 +652,6 @@ class ActionExecutor:
 
 if __name__ == '__main__':
     logger.warning('Starting Action Execution Server')
-
     parser = argparse.ArgumentParser()
     parser.add_argument('port', type=int, help='Port to listen on')
     parser.add_argument('--working-dir', type=str, help='Working directory')
@@ -631,6 +660,12 @@ if __name__ == '__main__':
         '--username', type=str, help='User to run as', default='openhands'
     )
     parser.add_argument('--user-id', type=int, help='User ID to run as', default=1000)
+    parser.add_argument(
+        '--enable-browser',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Enable the browser environment',
+    )
     parser.add_argument(
         '--browsergym-eval-env',
         type=str,
@@ -657,76 +692,56 @@ if __name__ == '__main__':
             plugins_to_load.append(ALL_PLUGINS[plugin]())  # type: ignore
 
     client: ActionExecutor | None = None
-    mcp_router: MCPRouter | None = None
-    MCP_ROUTER_PROFILE_PATH = os.path.join(
-        os.path.dirname(__file__), 'mcp', 'config.json'
-    )
+    mcp_proxy_manager: MCPProxyManager | None = None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global client, mcp_router
+        global client, mcp_proxy_manager
         logger.info('Initializing ActionExecutor...')
         client = ActionExecutor(
             plugins_to_load,
             work_dir=args.working_dir,
             username=args.username,
             user_id=args.user_id,
+            enable_browser=args.enable_browser,
             browsergym_eval_env=args.browsergym_eval_env,
         )
         await client.ainit()
         logger.info('ActionExecutor initialized.')
 
-        # Initialize and mount MCP Router
-        logger.info('Initializing MCP Router...')
-        mcp_router = MCPRouter(
-            profile_path=MCP_ROUTER_PROFILE_PATH,
-            router_config=RouterConfig(
-                api_key=SESSION_API_KEY,
+        # Check if we're on Windows
+        is_windows = sys.platform == 'win32'
+
+        # Initialize and mount MCP Proxy Manager (skip on Windows)
+        if is_windows:
+            logger.info('Skipping MCP Proxy initialization on Windows')
+            mcp_proxy_manager = None
+        else:
+            logger.info('Initializing MCP Proxy Manager...')
+            # Create a MCP Proxy Manager
+            mcp_proxy_manager = MCPProxyManager(
                 auth_enabled=bool(SESSION_API_KEY),
-            ),
-        )
-        allowed_origins = ['*']
-        sse_app = await mcp_router.get_sse_server_app(
-            allow_origins=allowed_origins, include_lifespan=False
-        )
-
-        # Check for route conflicts before mounting
-        main_app_routes = {route.path for route in app.routes}
-        sse_app_routes = {route.path for route in sse_app.routes}
-        conflicting_routes = main_app_routes.intersection(sse_app_routes)
-
-        if conflicting_routes:
-            logger.error(f'Route conflicts detected: {conflicting_routes}')
-            raise RuntimeError(
-                f'Cannot mount SSE app - conflicting routes found: {conflicting_routes}'
+                api_key=SESSION_API_KEY,
+                logger_level=logger.getEffectiveLevel(),
             )
-
-        app.mount('/', sse_app)
-        logger.info(
-            f'Mounted MCP Router SSE app at root path with allowed origins: {allowed_origins}'
-        )
-
-        # Additional debug logging
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug('Main app routes:')
-            for route in main_app_routes:
-                logger.debug(f'  {route}')
-            logger.debug('MCP SSE server app routes:')
-            for route in sse_app_routes:
-                logger.debug(f'  {route}')
+            mcp_proxy_manager.initialize()
+            # Mount the proxy to the app
+            allowed_origins = ['*']
+            try:
+                await mcp_proxy_manager.mount_to_app(app, allowed_origins)
+            except Exception as e:
+                logger.error(f'Error mounting MCP Proxy: {e}', exc_info=True)
+                raise RuntimeError(f'Cannot mount MCP Proxy: {e}')
 
         yield
 
         # Clean up & release the resources
-        logger.info('Shutting down MCP Router...')
-        if mcp_router:
-            try:
-                await mcp_router.shutdown()
-                logger.info('MCP Router shutdown successfully.')
-            except Exception as e:
-                logger.error(f'Error shutting down MCP Router: {e}', exc_info=True)
+        logger.info('Shutting down MCP Proxy Manager...')
+        if mcp_proxy_manager:
+            del mcp_proxy_manager
+            mcp_proxy_manager = None
         else:
-            logger.info('MCP Router instance not found for shutdown.')
+            logger.info('MCP Proxy Manager instance not found for shutdown.')
 
         logger.info('Closing ActionExecutor...')
         if client:
@@ -753,14 +768,14 @@ if __name__ == '__main__':
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-        logger.error(f'HTTP exception occurred: {exc.detail}')
+        logger.exception(f'HTTP exception occurred: {exc.detail}')
         return JSONResponse(status_code=exc.status_code, content={'detail': exc.detail})
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
         request: Request, exc: RequestValidationError
     ):
-        logger.error(f'Validation error occurred: {exc}')
+        logger.exception(f'Validation error occurred: {exc}')
         return JSONResponse(
             status_code=422,
             content={
@@ -807,25 +822,40 @@ if __name__ == '__main__':
             observation = await client.run_action(action)
             return event_to_dict(observation)
         except Exception as e:
-            logger.error(f'Error while running /execute_action: {str(e)}')
+            logger.exception(f'Error while running /execute_action: {str(e)}')
             raise HTTPException(
                 status_code=500,
-                detail=traceback.format_exc(),
+                detail=f'Internal server error: {str(e)}',
             )
+        finally:
+            update_last_execution_time()
 
     @app.post('/update_mcp_server')
     async def update_mcp_server(request: Request):
-        assert mcp_router is not None
-        assert os.path.exists(MCP_ROUTER_PROFILE_PATH)
+        # Check if we're on Windows
+        is_windows = sys.platform == 'win32'
 
-        # Use synchronous file operations outside of async function
-        def read_profile():
-            with open(MCP_ROUTER_PROFILE_PATH, 'r') as f:
-                return json.load(f)
+        # Access the global mcp_proxy_manager variable
+        global mcp_proxy_manager
 
-        current_profile = read_profile()
-        assert 'default' in current_profile
-        assert isinstance(current_profile['default'], list)
+        if is_windows:
+            # On Windows, just return a success response without doing anything
+            logger.info(
+                'MCP server update request received on Windows - skipping as MCP is disabled'
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    'detail': 'MCP server update skipped (MCP is disabled on Windows)',
+                    'router_error_log': '',
+                },
+            )
+
+        # Non-Windows implementation
+        if mcp_proxy_manager is None:
+            raise HTTPException(
+                status_code=500, detail='MCP Proxy Manager is not initialized'
+            )
 
         # Get the request body
         mcp_tools_to_sync = await request.json()
@@ -833,34 +863,31 @@ if __name__ == '__main__':
             raise HTTPException(
                 status_code=400, detail='Request must be a list of MCP tools to sync'
             )
-
         logger.info(
-            f'Updating MCP server to: {json.dumps(mcp_tools_to_sync, indent=2)}.\nPrevious profile: {json.dumps(current_profile, indent=2)}'
+            f'Updating MCP server with tools: {json.dumps(mcp_tools_to_sync, indent=2)}'
         )
-        current_profile['default'] = mcp_tools_to_sync
-
-        # Use synchronous file operations outside of async function
-        def write_profile(profile):
-            with open(MCP_ROUTER_PROFILE_PATH, 'w') as f:
-                json.dump(profile, f)
-
-        write_profile(current_profile)
-
-        # Manually reload the profile and update the servers
-        mcp_router.profile_manager.reload()
-        servers_wait_for_update = mcp_router.get_unique_servers()
-        await mcp_router.update_servers(servers_wait_for_update)
-        logger.info(
-            f'MCP router updated successfully with unique servers: {servers_wait_for_update}'
-        )
+        mcp_tools_to_sync = [MCPStdioServerConfig(**tool) for tool in mcp_tools_to_sync]
+        try:
+            await mcp_proxy_manager.update_and_remount(app, mcp_tools_to_sync, ['*'])
+            logger.info('MCP Proxy Manager updated and remounted successfully')
+            router_error_log = ''
+        except Exception as e:
+            logger.error(f'Error updating MCP Proxy Manager: {e}', exc_info=True)
+            router_error_log = str(e)
 
         return JSONResponse(
-            status_code=200, content={'detail': 'MCP server updated successfully'}
+            status_code=200,
+            content={
+                'detail': 'MCP server updated successfully',
+                'router_error_log': router_error_log,
+            },
         )
 
     @app.post('/upload_file')
     async def upload_file(
-        file: UploadFile, destination: str = '/', recursive: bool = False
+        file: UploadFile,
+        destination: str = '/',
+        recursive: bool = False,
     ):
         assert client is not None
 
@@ -883,7 +910,7 @@ if __name__ == '__main__':
                     )
 
                 zip_path = os.path.join(full_dest_path, file.filename)
-                with open(zip_path, 'wb') as buffer:  # noqa: ASYNC101
+                with open(zip_path, 'wb') as buffer:
                     shutil.copyfileobj(file.file, buffer)
 
                 # Extract the zip file
@@ -896,7 +923,7 @@ if __name__ == '__main__':
             else:
                 # For single file uploads
                 file_path = os.path.join(full_dest_path, file.filename)
-                with open(file_path, 'wb') as buffer:  # noqa: ASYNC101
+                with open(file_path, 'wb') as buffer:
                     shutil.copyfileobj(file.file, buffer)
                 logger.debug(f'Uploaded file {file.filename} to {destination}')
 
@@ -1003,12 +1030,12 @@ if __name__ == '__main__':
 
         if not os.path.exists(full_path):
             # if user just removed a folder, prevent server error 500 in UI
-            return []
+            return JSONResponse(content=[])
 
         try:
             # Check if the directory exists
             if not os.path.exists(full_path) or not os.path.isdir(full_path):
-                return []
+                return JSONResponse(content=[])
 
             entries = os.listdir(full_path)
 
@@ -1037,11 +1064,15 @@ if __name__ == '__main__':
 
             # Combine sorted directories and files
             sorted_entries = directories + files
-            return sorted_entries
+            return JSONResponse(content=sorted_entries)
 
         except Exception as e:
-            logger.error(f'Error listing files: {e}')
-            return []
+            logger.exception(f'Error listing files: {e}')
+            return JSONResponse(content=[])
 
     logger.debug(f'Starting action execution API on port {args.port}')
-    run(app, host='0.0.0.0', port=args.port)
+    # When LOG_JSON=1, provide a JSON log config to Uvicorn so error/access logs are structured
+    log_config = None
+    if os.getenv('LOG_JSON', '0') in ('1', 'true', 'True'):
+        log_config = get_uvicorn_json_log_config()
+    run(app, host='0.0.0.0', port=args.port, log_config=log_config, use_colors=False)

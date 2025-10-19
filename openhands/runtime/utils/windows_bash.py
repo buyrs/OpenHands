@@ -1,5 +1,4 @@
-"""
-This module provides a Windows-specific implementation for running commands
+"""This module provides a Windows-specific implementation for running commands
 in a PowerShell session using the pythonnet library to interact with the .NET
 PowerShell SDK directly. This aims to provide a more robust and integrated
 way to manage PowerShell processes compared to using temporary script files.
@@ -7,7 +6,6 @@ way to manage PowerShell processes compared to using temporary script files.
 
 import os
 import time
-import traceback
 from pathlib import Path
 from threading import RLock
 
@@ -20,21 +18,32 @@ from openhands.events.observation.commands import (
     CmdOutputMetadata,
     CmdOutputObservation,
 )
+from openhands.runtime.utils.bash_constants import TIMEOUT_MESSAGE_TEMPLATE
+from openhands.runtime.utils.windows_exceptions import DotNetMissingError
 from openhands.utils.shutdown_listener import should_continue
 
-pythonnet.load('coreclr')
-logger.info("Successfully called pythonnet.load('coreclr')")
-
-# Now that pythonnet is initialized, import clr and System
 try:
-    import clr
+    pythonnet.load('coreclr')
+    logger.info("Successfully called pythonnet.load('coreclr')")
 
-    logger.debug(f'Imported clr module from: {clr.__file__}')
-    # Load System assembly *after* pythonnet is initialized
-    clr.AddReference('System')
-    import System
-except Exception as clr_sys_ex:
-    raise RuntimeError(f'FATAL: Failed to import clr or System. Error: {clr_sys_ex}')
+    # Now that pythonnet is initialized, import clr and System
+    try:
+        import clr
+
+        logger.debug(f'Imported clr module from: {clr.__file__}')
+        # Load System assembly *after* pythonnet is initialized
+        clr.AddReference('System')
+        import System
+    except Exception as clr_sys_ex:
+        error_msg = 'Failed to import .NET components.'
+        details = str(clr_sys_ex)
+        logger.error(f'{error_msg} Details: {details}')
+        raise DotNetMissingError(error_msg, details)
+except Exception as coreclr_ex:
+    error_msg = 'Failed to load CoreCLR.'
+    details = str(coreclr_ex)
+    logger.error(f'{error_msg} Details: {details}')
+    raise DotNetMissingError(error_msg, details)
 
 # Attempt to load the PowerShell SDK assembly only if clr and System loaded
 ps_sdk_path = None
@@ -77,14 +86,14 @@ try:
         RunspaceState,
     )
 except Exception as e:
-    raise RuntimeError(
-        f'FATAL: Failed to load PowerShell SDK components. Error: {e}. Check pythonnet installation and .NET Runtime compatibility. Path searched: {ps_sdk_path}'
-    )
+    error_msg = 'Failed to load PowerShell SDK components.'
+    details = f'{str(e)} (Path searched: {ps_sdk_path})'
+    logger.error(f'{error_msg} Details: {details}')
+    raise DotNetMissingError(error_msg, details)
 
 
 class WindowsPowershellSession:
-    """
-    Manages a persistent PowerShell session using the .NET SDK via pythonnet.
+    """Manages a persistent PowerShell session using the .NET SDK via pythonnet.
 
     Allows executing commands within a single runspace, preserving state
     (variables, current directory) between calls.
@@ -98,8 +107,7 @@ class WindowsPowershellSession:
         no_change_timeout_seconds: int = 30,
         max_memory_mb: int | None = None,
     ):
-        """
-        Initializes the PowerShell session.
+        """Initializes the PowerShell session.
 
         Args:
             work_dir: The starting working directory for the session.
@@ -114,9 +122,11 @@ class WindowsPowershellSession:
 
         if PowerShell is None:  # Check if SDK loading failed during module import
             # Logged critical error during import, just raise here to prevent instantiation
-            raise RuntimeError(
-                'PowerShell SDK (System.Management.Automation.dll) could not be loaded. Cannot initialize WindowsPowershellSession.'
+            error_msg = (
+                'PowerShell SDK (System.Management.Automation.dll) could not be loaded.'
             )
+            logger.error(error_msg)
+            raise DotNetMissingError(error_msg)
 
         self.work_dir = os.path.abspath(work_dir)
         self.username = username
@@ -144,8 +154,7 @@ class WindowsPowershellSession:
             self._initialized = True  # Set to True only on successful initialization
             logger.info(f'PowerShell runspace created. Initial CWD set to: {self._cwd}')
         except Exception as e:
-            logger.error(f'Failed to create or open PowerShell runspace: {e}')
-            logger.error(traceback.format_exc())
+            logger.exception(f'Failed to create or open PowerShell runspace: {e}')
             self.close()  # Ensure cleanup if init fails partially
             raise RuntimeError(f'Failed to initialize PowerShell runspace: {e}')
 
@@ -166,8 +175,7 @@ class WindowsPowershellSession:
                 # Optional: Confirm CWD even on success for robustness
                 # self._confirm_cwd()
         except Exception as e:
-            logger.error(f'Exception setting initial CWD: {e}')
-            logger.error(traceback.format_exc())
+            logger.exception(f'Exception setting initial CWD: {e}')
             # Attempt to confirm CWD even if setting threw an exception
             self._confirm_cwd()
         finally:
@@ -374,9 +382,7 @@ class WindowsPowershellSession:
     def _check_active_job(
         self, timeout_seconds: int
     ) -> CmdOutputObservation | ErrorObservation:
-        """
-        Checks the active job for new output and status, waiting up to timeout_seconds.
-        """
+        """Checks the active job for new output and status, waiting up to timeout_seconds."""
         with self._job_lock:
             if not self.active_job:
                 return ErrorObservation(
@@ -559,9 +565,7 @@ class WindowsPowershellSession:
             else:
                 metadata.suffix = (
                     f'\n[The command timed out after {timeout_seconds} seconds. '
-                    "You may wait longer to see additional output by sending empty command '', "
-                    'send other commands to interact with the current process, '
-                    'or send keys to interrupt/kill the command.]'
+                    f'{TIMEOUT_MESSAGE_TEMPLATE}]'
                 )
 
             return CmdOutputObservation(
@@ -637,8 +641,7 @@ class WindowsPowershellSession:
         return self._cwd
 
     def execute(self, action: CmdRunAction) -> CmdOutputObservation | ErrorObservation:
-        """
-        Executes a command, potentially as a PowerShell background job for long-running tasks.
+        """Executes a command, potentially as a PowerShell background job for long-running tasks.
         Aligned with bash.py behavior regarding command execution and messages.
 
         Args:
@@ -849,9 +852,7 @@ class WindowsPowershellSession:
                             f'\n[Your command "{command}" is NOT executed. '
                             f'The previous command is still running - You CANNOT send new commands until the previous command is completed. '
                             'By setting `is_input` to `true`, you can interact with the current process: '
-                            "You may wait longer to see additional output of the previous command by sending empty command '', "
-                            'send other commands to interact with the current process, '
-                            'or send keys ("C-c", "C-z", "C-d") to interrupt/kill the previous command before sending your new command.]'
+                            f'{TIMEOUT_MESSAGE_TEMPLATE}]'
                         )
 
                         return CmdOutputObservation(
@@ -941,8 +942,7 @@ class WindowsPowershellSession:
                 )
 
         except Exception as parse_ex:
-            logger.error(f'Exception during PowerShell command parsing: {parse_ex}')
-            logger.error(traceback.format_exc())
+            logger.exception(f'Exception during PowerShell command parsing: {parse_ex}')
             return ErrorObservation(
                 content=f'ERROR: An exception occurred while parsing the command: {parse_ex}'
             )
@@ -1114,10 +1114,9 @@ class WindowsPowershellSession:
                         with self._job_lock:
                             self.active_job = None
                 except AttributeError as e:
-                    logger.error(
+                    logger.exception(
                         f'Get-Job returned an object without expected properties on BaseObject: {e}'
                     )
-                    logger.error(traceback.format_exc())
                     all_errors.append('Get-Job did not return a valid Job object.')
                     job_start_failed = True
 
@@ -1127,8 +1126,7 @@ class WindowsPowershellSession:
                 job_start_failed = True
 
         except Exception as start_ex:
-            logger.error(f'Exception during job start/retrieval: {start_ex}')
-            logger.error(traceback.format_exc())
+            logger.exception(f'Exception during job start/retrieval: {start_ex}')
             all_errors.append(f'[Job Start/Get Exception: {start_ex}]')
             job_start_failed = True
         finally:
@@ -1331,9 +1329,7 @@ class WindowsPowershellSession:
             # Align suffix with bash.py timeout message
             suffix = (
                 f'\n[The command timed out after {timeout_seconds} seconds. '
-                "You may wait longer to see additional output by sending empty command '', "
-                'send other commands to interact with the current process, '
-                'or send keys to interrupt/kill the command.]'
+                f'{TIMEOUT_MESSAGE_TEMPLATE}]'
             )
         elif shutdown_requested:
             # Align suffix with bash.py equivalent (though bash.py might not have specific shutdown message)
@@ -1401,8 +1397,7 @@ class WindowsPowershellSession:
                 self.runspace.Dispose()
                 logger.info('PowerShell runspace closed and disposed.')
             except Exception as e:
-                logger.error(f'Error closing/disposing PowerShell runspace: {e}')
-                logger.error(traceback.format_exc())
+                logger.exception(f'Error closing/disposing PowerShell runspace: {e}')
 
         self.runspace = None
         self._initialized = False

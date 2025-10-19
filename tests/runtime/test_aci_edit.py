@@ -8,6 +8,7 @@ from conftest import _close_test_runtime, _load_runtime
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import FileEditAction, FileWriteAction
 from openhands.runtime.action_execution_server import _execute_file_editor
+from openhands.runtime.impl.cli.cli_runtime import CLIRuntime
 
 
 def test_view_file(temp_dir, runtime_cls, run_as_openhands):
@@ -37,7 +38,9 @@ def test_view_file(temp_dir, runtime_cls, run_as_openhands):
 
 
 def test_view_directory(temp_dir, runtime_cls, run_as_openhands):
-    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
+    runtime, config = _load_runtime(
+        temp_dir, runtime_cls, run_as_openhands, enable_browser=True
+    )
     try:
         # Create test file
         test_file = os.path.join(config.workspace_mount_path_in_sandbox, 'test.txt')
@@ -58,7 +61,9 @@ def test_view_directory(temp_dir, runtime_cls, run_as_openhands):
             obs.content
             == f"""Here's the files and directories up to 2 levels deep in {config.workspace_mount_path_in_sandbox}, excluding hidden items:
 {config.workspace_mount_path_in_sandbox}/
-{config.workspace_mount_path_in_sandbox}/test.txt"""
+{config.workspace_mount_path_in_sandbox}/test.txt
+
+1 hidden files/directories in this directory are excluded. You can use 'ls -la /workspace' to see them."""  # The hidden dir is the /workspace/.downloads
         )
 
     finally:
@@ -353,10 +358,19 @@ def test_str_replace_with_empty_old_str(temp_dir, runtime_cls, run_as_openhands)
         )
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-        assert (
-            'No replacement was performed. Multiple occurrences of old_str `` in lines [1, 2, 3, 4]. Please ensure it is unique.'
-            in obs.content
-        )
+        if isinstance(runtime, CLIRuntime):
+            # CLIRuntime with a 3-line file without a trailing newline reports 3 occurrences for an empty old_str
+            assert (
+                'No replacement was performed. Multiple occurrences of old_str `` in lines [1, 2, 3]. Please ensure it is unique.'
+                in obs.content
+            )
+        else:
+            # Other runtimes might behave differently (e.g., implicitly add a newline, leading to 4 matches)
+            # TODO: Why do they have 4 lines?
+            assert (
+                'No replacement was performed. Multiple occurrences of old_str `` in lines [1, 2, 3, 4]. Please ensure it is unique.'
+                in obs.content
+            )
     finally:
         _close_test_runtime(runtime)
 

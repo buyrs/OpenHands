@@ -1,16 +1,17 @@
 import { OpenHandsActionEvent } from "./base";
-import { ActionSecurityRisk } from "#/state/security-analyzer-slice";
+import { ActionSecurityRisk } from "#/stores/security-analyzer-store";
 
 export interface UserMessageAction extends OpenHandsActionEvent<"message"> {
   source: "user";
   args: {
     content: string;
     image_urls: string[];
+    file_urls: string[];
   };
 }
 
 export interface SystemMessageAction extends OpenHandsActionEvent<"system"> {
-  source: "agent";
+  source: "agent" | "environment";
   args: {
     content: string;
     tools: Array<Record<string, unknown>> | null;
@@ -20,7 +21,7 @@ export interface SystemMessageAction extends OpenHandsActionEvent<"system"> {
 }
 
 export interface CommandAction extends OpenHandsActionEvent<"run"> {
-  source: "agent";
+  source: "agent" | "user";
   args: {
     command: string;
     security_risk: ActionSecurityRisk;
@@ -36,6 +37,7 @@ export interface AssistantMessageAction
   args: {
     thought: string;
     image_urls: string[] | null;
+    file_urls: string[];
     wait_for_response: boolean;
   };
 }
@@ -62,7 +64,6 @@ export interface FinishAction extends OpenHandsActionEvent<"finish"> {
   source: "agent";
   args: {
     final_thought: string;
-    task_completed: "success" | "failure" | "partial";
     outputs: Record<string, unknown>;
     thought: string;
   };
@@ -161,6 +162,21 @@ export interface MCPAction extends OpenHandsActionEvent<"call_tool_mcp"> {
   };
 }
 
+export interface TaskTrackingAction
+  extends OpenHandsActionEvent<"task_tracking"> {
+  source: "agent";
+  args: {
+    command: string;
+    task_list: Array<{
+      id: string;
+      title: string;
+      status: "todo" | "in_progress" | "done";
+      notes?: string;
+    }>;
+    thought: string;
+  };
+}
+
 export type OpenHandsAction =
   | UserMessageAction
   | AssistantMessageAction
@@ -177,4 +193,5 @@ export type OpenHandsAction =
   | FileWriteAction
   | RejectAction
   | RecallAction
-  | MCPAction;
+  | MCPAction
+  | TaskTrackingAction;

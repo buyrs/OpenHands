@@ -3,6 +3,7 @@ import { I18nKey } from "#/i18n/declaration";
 import { SettingsInput } from "../settings-input";
 import { GitHubTokenHelpAnchor } from "./github-token-help-anchor";
 import { KeyStatusIcon } from "../key-status-icon";
+import { cn } from "#/utils/utils";
 
 interface GitHubTokenInputProps {
   onChange: (value: string) => void;
@@ -10,6 +11,7 @@ interface GitHubTokenInputProps {
   isGitHubTokenSet: boolean;
   name: string;
   githubHostSet: string | null | undefined;
+  className?: string;
 }
 
 export function GitHubTokenInput({
@@ -18,18 +20,19 @@ export function GitHubTokenInput({
   isGitHubTokenSet,
   name,
   githubHostSet,
+  className,
 }: GitHubTokenInputProps) {
   const { t } = useTranslation();
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className={cn("flex flex-col gap-6", className)}>
       <SettingsInput
         testId={name}
         name={name}
         onChange={onChange}
         label={t(I18nKey.GITHUB$TOKEN_LABEL)}
         type="password"
-        className="w-[680px]"
+        className="w-full max-w-[680px]"
         placeholder={isGitHubTokenSet ? "<hidden>" : ""}
         startContent={
           isGitHubTokenSet && (
@@ -47,7 +50,7 @@ export function GitHubTokenInput({
         testId="github-host-input"
         label={t(I18nKey.GITHUB$HOST_LABEL)}
         type="text"
-        className="w-[680px]"
+        className="w-full max-w-[680px]"
         placeholder="github.com"
         defaultValue={githubHostSet || undefined}
         startContent={

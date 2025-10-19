@@ -2,6 +2,12 @@
 
 This folder contains the evaluation harness that we built on top of the original [SWE-Bench benchmark](https://www.swebench.com/) ([paper](https://arxiv.org/abs/2310.06770)).
 
+**UPDATE (8/12/2025): We now support running SWE-rebench evaluation (see the paper [here](https://arxiv.org/abs/2505.20411))! For how to run it, checkout [this README](./SWE-rebench.md).**
+
+**UPDATE (6/15/2025): We now support running SWE-bench-Live evaluation (see the paper [here](https://arxiv.org/abs/2505.23419))! For how to run it, checkout [this README](./SWE-bench-Live.md).**
+
+**UPDATE (5/26/2025): We now support running interactive SWE-Bench evaluation (see the paper [here](https://arxiv.org/abs/2502.13069))! For how to run it, checkout [this README](./SWE-Interact.md).**
+
 **UPDATE (4/8/2025): We now support running SWT-Bench evaluation! For more details, checkout [the corresponding section](#SWT-Bench-Evaluation).**
 
 **UPDATE (03/27/2025): We now support SWE-Bench multimodal evaluation! Simply use "princeton-nlp/SWE-bench_Multimodal" as the dataset name in the `run_infer.sh` script to evaluate on multimodal instances.**
@@ -34,6 +40,10 @@ Please follow instruction [here](../../README.md#setup) to setup your local deve
 > - If your LLM config has temperature=0, we will automatically use temperature=0.1 for the 2nd and 3rd attempts
 >
 > To enable this iterative protocol, set `export ITERATIVE_EVAL_MODE=true`
+>
+> **Skipping errors on build**
+>
+> For debugging purposes, you can set `export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true` to continue evaluation even when instances reach maximum retries. After evaluation completes, check `maximum_retries_exceeded.jsonl` for a list of failed instances, fix those issues, and then run the evaluation again with `export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=false`.
 
 
 ### Running Locally with Docker
@@ -45,7 +55,7 @@ For example, for instance ID `django_django-11011`, it will try to pull our pre-
 This image will be used create an OpenHands runtime image where the agent will operate on.
 
 ```bash
-./evaluation/benchmarks/swe_bench/scripts/run_infer.sh [model_config] [git-version] [agent] [eval_limit] [max_iter] [num_workers] [dataset] [dataset_split]
+./evaluation/benchmarks/swe_bench/scripts/run_infer.sh [model_config] [git-version] [agent] [eval_limit] [max_iter] [num_workers] [dataset] [dataset_split] [n_runs] [mode]
 
 # Example
 ./evaluation/benchmarks/swe_bench/scripts/run_infer.sh llm.eval_gpt4_1106_preview HEAD CodeActAgent 500 100 1 princeton-nlp/SWE-bench_Verified test
@@ -69,13 +79,23 @@ default, it is set to 1.
 - `dataset`, a huggingface dataset name. e.g. `princeton-nlp/SWE-bench`, `princeton-nlp/SWE-bench_Lite`, `princeton-nlp/SWE-bench_Verified`, or `princeton-nlp/SWE-bench_Multimodal`, specifies which dataset to evaluate on.
 - `dataset_split`, split for the huggingface dataset. e.g., `test`, `dev`. Default to `test`.
 
+- `n_runs`, e.g. `3`, is the number of times to run the evaluation. Default is 1.
+- `mode`, e.g. `swt`, `swt-ci`, or `swe`, specifies the evaluation mode. Default is `swe`.
+
 > [!CAUTION]
 > Setting `num_workers` larger than 1 is not officially tested, YMMV.
 
-There is also one optional environment variable you can set.
+There are also optional environment variables you can set:
 
 ```bash
-export USE_HINT_TEXT=true # if you want to use hint text in the evaluation. Default to false. Ignore this if you are not sure.
+# Use hint text in the evaluation (default: false)
+export USE_HINT_TEXT=true # Ignore this if you are not sure.
+
+# Specify a condenser configuration for memory management (default: NoOpCondenser)
+export EVAL_CONDENSER=summarizer_for_eval # Name of the condenser config group in config.toml
+
+# Specify the instruction prompt template file name
+export INSTRUCTION_TEMPLATE_NAME=swe_custom.j2 # Name of the file in the swe_bench/prompts folder.
 ```
 
 Let's say you'd like to run 10 instances using `llm.eval_gpt4_1106_preview` and CodeActAgent,
@@ -151,6 +171,8 @@ The script now accepts optional arguments:
 - `instance_id`: Specify a single instance to evaluate (optional)
 - `dataset_name`: The name of the dataset to use (default: `"princeton-nlp/SWE-bench_Lite"`)
 - `split`: The split of the dataset to use (default: `"test"`)
+- `environment`: The environment to use for patch evaluation (default: `"local"`). You can set it to
+  `"modal"` to use [official SWE-Bench support](https://github.com/swe-bench/SWE-bench/blob/main/docs/assets/evaluation.md#%EF%B8%8F-evaluation-with-modal) for running evaluation on Modal.
 
 For example, to evaluate a specific instance with a custom dataset and split:
 
@@ -166,24 +188,7 @@ The final results will be saved to `evaluation/evaluation_outputs/outputs/swe_be
 - `report.json`: a JSON file that contains keys like `"resolved_ids"` pointing to instance IDs that are resolved by the agent.
 - `logs/`: a directory of test logs
 
-### Run evaluation with `RemoteRuntime`
 
-OpenHands Remote Runtime is currently in beta (read [here](https://runtime.all-hands.dev/) for more details), it allows you to run rollout in parallel in the cloud, so you don't need a powerful machine to run evaluation.
-Fill out [this form](https://docs.google.com/forms/d/e/1FAIpQLSckVz_JFwg2_mOxNZjCtr7aoBFI2Mwdan3f75J_TrdMS1JV2g/viewform) to apply if you want to try this out!
-
-```bash
-./evaluation/benchmarks/swe_bench/scripts/eval_infer_remote.sh [output.jsonl filepath] [num_workers]
-
-# Example - This evaluates patches generated by CodeActAgent on Llama-3.1-70B-Instruct-Turbo on "princeton-nlp/SWE-bench_Lite"'s test set, with 16 number of workers running in parallel
-ALLHANDS_API_KEY="YOUR-API-KEY" RUNTIME=remote SANDBOX_REMOTE_RUNTIME_API_URL="https://runtime.eval.all-hands.dev" EVAL_DOCKER_IMAGE_PREFIX="us-central1-docker.pkg.dev/evaluation-092424/swe-bench-images" \
-evaluation/benchmarks/swe_bench/scripts/eval_infer_remote.sh evaluation/evaluation_outputs/outputs/swe-bench-lite/CodeActAgent/Llama-3.1-70B-Instruct-Turbo_maxiter_100_N_v1.9-no-hint/output.jsonl 16 "princeton-nlp/SWE-bench_Lite" "test"
-```
-
-To clean-up all existing runtimes that you've already started, run:
-
-```bash
-ALLHANDS_API_KEY="YOUR-API-KEY" ./evaluation/utils/scripts/cleanup_remote_runtime.sh
-```
 
 ## SWT-Bench Evaluation
 

@@ -17,7 +17,8 @@ from evaluation.utils.shared import (
     EvalMetadata,
     EvalOutput,
     compatibility_for_eval_history_pairs,
-    get_default_sandbox_config_for_eval,
+    get_metrics,
+    get_openhands_config_for_eval,
     make_metadata,
     prepare_dataset,
     reset_logger_for_multiprocessing,
@@ -25,7 +26,7 @@ from evaluation.utils.shared import (
 )
 from openhands.controller.state.state import State
 from openhands.core.config import (
-    AppConfig,
+    OpenHandsConfig,
     get_llm_config_arg,
     parse_arguments,
 )
@@ -39,20 +40,13 @@ from openhands.utils.async_utils import call_async_from_sync
 
 def get_config(
     metadata: EvalMetadata,
-) -> AppConfig:
-    sandbox_config = get_default_sandbox_config_for_eval()
-    sandbox_config.base_container_image = 'python:3.12-slim'
+) -> OpenHandsConfig:
+    # Create config with agent_bench-specific container image
+    config = get_openhands_config_for_eval(metadata=metadata)
 
-    config = AppConfig(
-        default_agent=metadata.agent_class,
-        run_as_openhands=False,
-        runtime=os.environ.get('RUNTIME', 'docker'),
-        max_iterations=metadata.max_iterations,
-        sandbox=sandbox_config,
-        # do not mount workspace
-        workspace_base=None,
-        workspace_mount_path=None,
-    )
+    # Override the container image for agent_bench
+    config.sandbox.base_container_image = 'python:3.12-slim'
+
     config.set_llm_config(metadata.llm_config)
     agent_config = config.get_agent_config(metadata.agent_class)
     agent_config.enable_prompt_extensions = False
@@ -273,7 +267,7 @@ def process_instance(
     # remove when it becomes unnecessary
     histories = compatibility_for_eval_history_pairs(state.history)
 
-    metrics = state.metrics.get() if state.metrics else None
+    metrics = get_metrics(state)
 
     # Save the output
     output = EvalOutput(

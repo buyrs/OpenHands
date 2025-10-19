@@ -1,26 +1,16 @@
 import { useEffect } from "react";
-import { useSelector, useDispatch } from "react-redux";
-import { RootState } from "#/store";
 import { BrowserSnapshot } from "./browser-snapshot";
 import { EmptyBrowserMessage } from "./empty-browser-message";
-import { useConversation } from "#/context/conversation-context";
-import {
-  initialState as browserInitialState,
-  setUrl,
-  setScreenshotSrc,
-} from "#/state/browser-slice";
+import { useConversationId } from "#/hooks/use-conversation-id";
+import { useBrowserStore } from "#/stores/browser-store";
 
 export function BrowserPanel() {
-  const { url, screenshotSrc } = useSelector(
-    (state: RootState) => state.browser,
-  );
-  const { conversationId } = useConversation();
-  const dispatch = useDispatch();
+  const { url, screenshotSrc, reset } = useBrowserStore();
+  const { conversationId } = useConversationId();
 
   useEffect(() => {
-    dispatch(setUrl(browserInitialState.url));
-    dispatch(setScreenshotSrc(browserInitialState.screenshotSrc));
-  }, [conversationId]);
+    reset();
+  }, [conversationId, reset]);
 
   const imgSrc =
     screenshotSrc && screenshotSrc.startsWith("data:image/png;base64,")

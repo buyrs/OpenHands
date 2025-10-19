@@ -1,6 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
 import React from "react";
-import { Link } from "react-router";
 import { useTranslation } from "react-i18next";
 import { useGetSecrets } from "#/hooks/query/use-get-secrets";
 import { useDeleteSecret } from "#/hooks/mutation/use-delete-secret";
@@ -12,20 +11,14 @@ import {
 import { BrandButton } from "#/components/features/settings/brand-button";
 import { ConfirmationModal } from "#/components/shared/modals/confirmation-modal";
 import { GetSecretsResponse } from "#/api/secrets-service.types";
-import { useUserProviders } from "#/hooks/use-user-providers";
-import { useConfig } from "#/hooks/query/use-config";
+import { I18nKey } from "#/i18n/declaration";
 
 function SecretsSettingsScreen() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
 
-  const { data: config } = useConfig();
   const { data: secrets, isLoading: isLoadingSecrets } = useGetSecrets();
   const { mutate: deleteSecret } = useDeleteSecret();
-  const { providers } = useUserProviders();
-
-  const isSaas = config?.APP_MODE === "saas";
-  const hasProviderSet = providers.length > 0;
 
   const [view, setView] = React.useState<
     "list" | "add-secret-form" | "edit-secret-form"
@@ -68,13 +61,8 @@ function SecretsSettingsScreen() {
     setConfirmationModalIsVisible(false);
   };
 
-  const shouldRenderConnectToGitButton = isSaas && !hasProviderSet;
-
   return (
-    <div
-      data-testid="secrets-settings-screen"
-      className="px-11 py-9 flex flex-col gap-5"
-    >
+    <div data-testid="secrets-settings-screen" className="flex flex-col gap-5">
       {isLoadingSecrets && view === "list" && (
         <ul>
           <SecretListItemSkeleton />
@@ -83,41 +71,7 @@ function SecretsSettingsScreen() {
         </ul>
       )}
 
-      {shouldRenderConnectToGitButton && (
-        <Link to="/settings/git" data-testid="connect-git-button" type="button">
-          <BrandButton type="button" variant="secondary">
-            Connect a Git provider to manage secrets
-          </BrandButton>
-        </Link>
-      )}
-
-      {secrets?.length === 0 && view === "list" && (
-        <p data-testid="no-secrets-message">{t("SECRETS$NO_SECRETS_FOUND")}</p>
-      )}
-
       {view === "list" && (
-        <table className="w-full">
-          <tbody>
-            {secrets?.map((secret) => (
-              <SecretListItem
-                key={secret.name}
-                title={secret.name}
-                description={secret.description}
-                onEdit={() => {
-                  setView("edit-secret-form");
-                  setSelectedSecret(secret.name);
-                }}
-                onDelete={() => {
-                  setConfirmationModalIsVisible(true);
-                  setSelectedSecret(secret.name);
-                }}
-              />
-            ))}
-          </tbody>
-        </table>
-      )}
-
-      {!shouldRenderConnectToGitButton && view === "list" && (
         <BrandButton
           testId="add-secret-button"
           type="button"
@@ -127,6 +81,43 @@ function SecretsSettingsScreen() {
         >
           {t("SECRETS$ADD_NEW_SECRET")}
         </BrandButton>
+      )}
+
+      {view === "list" && (
+        <div className="border border-tertiary rounded-md overflow-hidden">
+          <table className="w-full">
+            <thead className="bg-base-tertiary">
+              <tr className="flex w-full items-center">
+                <th className="w-1/4 text-left p-3 text-sm font-medium">
+                  {t(I18nKey.SETTINGS$NAME)}
+                </th>
+                <th className="w-1/2 text-left p-3 text-sm font-medium">
+                  {t(I18nKey.SECRETS$DESCRIPTION)}
+                </th>
+                <th className="w-1/4 text-right p-3 text-sm font-medium">
+                  {t(I18nKey.SETTINGS$ACTIONS)}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {secrets?.map((secret) => (
+                <SecretListItem
+                  key={secret.name}
+                  title={secret.name}
+                  description={secret.description}
+                  onEdit={() => {
+                    setView("edit-secret-form");
+                    setSelectedSecret(secret.name);
+                  }}
+                  onDelete={() => {
+                    setConfirmationModalIsVisible(true);
+                    setSelectedSecret(secret.name);
+                  }}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
 
       {(view === "add-secret-form" || view === "edit-secret-form") && (

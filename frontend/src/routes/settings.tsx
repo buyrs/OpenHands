@@ -1,88 +1,78 @@
-import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
+import { useMemo } from "react";
+import { Outlet, redirect, useLocation } from "react-router";
 import { useTranslation } from "react-i18next";
-import React from "react";
-import SettingsIcon from "#/icons/settings.svg?react";
-import { cn } from "#/utils/utils";
 import { useConfig } from "#/hooks/query/use-config";
-import { I18nKey } from "#/i18n/declaration";
+import { Route } from "./+types/settings";
+import OptionService from "#/api/option-service/option-service.api";
+import { queryClient } from "#/query-client-config";
+import { GetConfigResponse } from "#/api/option-service/option.types";
+import { useSubscriptionAccess } from "#/hooks/query/use-subscription-access";
+import { SAAS_NAV_ITEMS, OSS_NAV_ITEMS } from "#/constants/settings-nav";
+import { Typography } from "#/ui/typography";
+import { SettingsLayout } from "#/components/features/settings/settings-layout";
 
-function SettingsScreen() {
-  const { t } = useTranslation();
-  const navigate = useNavigate();
-  const { pathname } = useLocation();
-  const { data: config } = useConfig();
+const SAAS_ONLY_PATHS = [
+  "/settings/user",
+  "/settings/billing",
+  "/settings/credits",
+  "/settings/api-keys",
+];
+
+export const clientLoader = async ({ request }: Route.ClientLoaderArgs) => {
+  const url = new URL(request.url);
+  const { pathname } = url;
+
+  let config = queryClient.getQueryData<GetConfigResponse>(["config"]);
+  if (!config) {
+    config = await OptionService.getConfig();
+    queryClient.setQueryData<GetConfigResponse>(["config"], config);
+  }
 
   const isSaas = config?.APP_MODE === "saas";
 
-  const saasNavItems = [
-    { to: "/settings/git", text: t("SETTINGS$NAV_GIT") },
-    { to: "/settings/app", text: t("SETTINGS$NAV_APPLICATION") },
-    { to: "/settings/billing", text: t("SETTINGS$NAV_CREDITS") },
-    { to: "/settings/secrets", text: t("SETTINGS$NAV_SECRETS") },
-    { to: "/settings/api-keys", text: t("SETTINGS$NAV_API_KEYS") },
-  ];
+  if (!isSaas && SAAS_ONLY_PATHS.includes(pathname)) {
+    // if in OSS mode, do not allow access to saas-only paths
+    return redirect("/settings");
+  }
 
-  const ossNavItems = [
-    { to: "/settings", text: t("SETTINGS$NAV_LLM") },
-    { to: "/settings/mcp", text: t("SETTINGS$NAV_MCP") },
-    { to: "/settings/git", text: t("SETTINGS$NAV_GIT") },
-    { to: "/settings/app", text: t("SETTINGS$NAV_APPLICATION") },
-    { to: "/settings/secrets", text: t("SETTINGS$NAV_SECRETS") },
-  ];
+  return null;
+};
 
-  React.useEffect(() => {
+function SettingsScreen() {
+  const { t } = useTranslation();
+  const { data: config } = useConfig();
+  const { data: subscriptionAccess } = useSubscriptionAccess();
+  const location = useLocation();
+
+  const isSaas = config?.APP_MODE === "saas";
+
+  // Navigation items configuration
+  const navItems = useMemo(() => {
+    const items = [];
     if (isSaas) {
-      if (pathname === "/settings") {
-        navigate("/settings/git");
-      }
+      items.push(...SAAS_NAV_ITEMS);
     } else {
-      const noEnteringPaths = [
-        "/settings/billing",
-        "/settings/credits",
-        "/settings/api-keys",
-      ];
-      if (noEnteringPaths.includes(pathname)) {
-        navigate("/settings");
-      }
+      items.push(...OSS_NAV_ITEMS);
     }
-  }, [isSaas, pathname]);
+    return items;
+  }, [isSaas, !!subscriptionAccess]);
 
-  const navItems = isSaas ? saasNavItems : ossNavItems;
+  // Current section title for the main content area
+  const currentSectionTitle = useMemo(() => {
+    const currentItem = navItems.find((item) => item.to === location.pathname);
+    return currentItem ? currentItem.text : "SETTINGS$NAV_LLM";
+  }, [navItems, location.pathname]);
 
   return (
-    <main
-      data-testid="settings-screen"
-      className="bg-base-secondary border border-tertiary h-full rounded-xl flex flex-col"
-    >
-      <header className="px-3 py-1.5 border-b border-b-tertiary flex items-center gap-2">
-        <SettingsIcon width={16} height={16} />
-        <h1 className="text-sm leading-6">{t(I18nKey.SETTINGS$TITLE)}</h1>
-      </header>
-
-      <nav
-        data-testid="settings-navbar"
-        className="flex items-end gap-6 px-9 border-b border-tertiary"
-      >
-        {navItems.map(({ to, text }) => (
-          <NavLink
-            end
-            key={to}
-            to={to}
-            className={({ isActive }) =>
-              cn(
-                "border-b-2 border-transparent py-2.5 px-4 min-w-[40px] flex items-center justify-center",
-                isActive && "border-primary",
-              )
-            }
-          >
-            <span className="text-[#F9FBFE] text-sm">{text}</span>
-          </NavLink>
-        ))}
-      </nav>
-
-      <div className="flex flex-col grow overflow-auto">
-        <Outlet />
-      </div>
+    <main data-testid="settings-screen" className="h-full">
+      <SettingsLayout navigationItems={navItems} isSaas={isSaas}>
+        <div className="flex flex-col gap-6 h-full">
+          <Typography.H2>{t(currentSectionTitle)}</Typography.H2>
+          <div className="flex-1 overflow-auto custom-scrollbar-always">
+            <Outlet />
+          </div>
+        </div>
+      </SettingsLayout>
     </main>
   );
 }

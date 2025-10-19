@@ -19,14 +19,15 @@ from evaluation.utils.shared import (
     EvalMetadata,
     EvalOutput,
     get_default_sandbox_config_for_eval,
+    get_openhands_config_for_eval,
     prepare_dataset,
     reset_logger_for_multiprocessing,
     run_evaluation,
 )
 from openhands.core.config import (
-    AppConfig,
     LLMConfig,
-    get_parser,
+    OpenHandsConfig,
+    get_evaluation_parser,
 )
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.main import create_runtime
@@ -69,7 +70,7 @@ def process_git_patch(patch):
     return patch
 
 
-def get_config(metadata: EvalMetadata, instance: pd.Series) -> AppConfig:
+def get_config(metadata: EvalMetadata, instance: pd.Series) -> OpenHandsConfig:
     # We use a different instance image for the each instance of swe-bench eval
     base_container_image = get_instance_docker_image(instance['instance_id'])
     logger.info(
@@ -83,13 +84,9 @@ def get_config(metadata: EvalMetadata, instance: pd.Series) -> AppConfig:
         dataset_name=metadata.dataset,
         instance_id=instance['instance_id'],
     )
-    config = AppConfig(
-        run_as_openhands=False,
+    config = get_openhands_config_for_eval(
         runtime=os.environ.get('RUNTIME', 'docker'),
-        sandbox=sandbox_config,
-        # do not mount workspace
-        workspace_base=None,
-        workspace_mount_path=None,
+        sandbox_config=sandbox_config,
     )
     return config
 
@@ -111,8 +108,7 @@ def process_instance(
     runtime_failure_count: int = 0,
     conditional_imports: ConditionalImports | None = None,
 ) -> EvalOutput:
-    """
-    Evaluate agent performance on a SWE-bench problem instance.
+    """Evaluate agent performance on a SWE-bench problem instance.
 
     Note that this signature differs from the expected input to `run_evaluation`. Use
     `functools.partial` to provide optional arguments before passing to the evaluation harness.
@@ -353,7 +349,7 @@ def process_instance(
 
 
 if __name__ == '__main__':
-    parser = get_parser()
+    parser = get_evaluation_parser()
     parser.add_argument(
         '--input-file',
         type=str,
